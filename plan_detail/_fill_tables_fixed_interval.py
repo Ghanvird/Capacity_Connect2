@@ -1,0 +1,710 @@
+
+from __future__ import annotations
+import math
+import re
+import datetime as dt
+from typing import Optional, Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+from dash import dash_table
+from capacity_core import min_agents
+
+from plan_store import get_plan
+from cap_store import resolve_settings, load_roster_long
+from ._grain_cols import interval_cols_for_day
+from ._common import _week_span
+from ._calc import _fill_tables_fixed
+from ._common import (
+    _canon_scope,
+    _assemble_voice,
+    _assemble_chat,
+    _assemble_ob,
+    _load_ts_with_fallback,
+)
+
+
+def _pick_ivl_col(df: pd.DataFrame) -> Optional[str]:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return None
+    low = {str(c).strip().lower(): c for c in df.columns}
+    for k in ("interval", "time", "interval_start", "start_time", "slot"):
+        c = low.get(k)
+        if c and c in df.columns:
+            return c
+    return None
+
+
+def _parse_time_any(s: str) -> Optional[dt.time]:
+    try:
+        if s is None:
+            return None
+        t = str(s).strip()
+        if not t:
+            return None
+        # Try common 12h and 24h formats
+        for fmt in ("%I:%M:%S %p", "%I:%M %p", "%H:%M:%S", "%H:%M"):
+            try:
+                return dt.datetime.strptime(t, fmt).time()
+            except Exception:
+                pass
+        # Fallback: pandas parser
+        ts = pd.to_datetime(t, errors="coerce")
+        if pd.isna(ts):
+            return None
+        return ts.time()
+    except Exception:
+        return None
+
+
+def _fmt_hhmm(t: dt.time) -> str:
+    try:
+        return f"{t.hour:02d}:{t.minute:02d}"
+    except Exception:
+        return "00:00"
+
+
+def _slot_series_for_day(df: pd.DataFrame, day: dt.date, val_col: str) -> Dict[str, float]:
+    if not isinstance(df, pd.DataFrame) or df.empty or val_col not in df.columns:
+        return {}
+    d = df.copy()
+    L = {str(c).strip().lower(): c for c in d.columns}
+    c_date = L.get("date") or L.get("day")
+    c_ivl = _pick_ivl_col(d)
+    if not c_ivl:
+        return {}
+    if c_date:
+        d[c_date] = pd.to_datetime(d[c_date], errors="coerce").dt.date
+        d = d[d[c_date].eq(day)]
+    if d.empty:
+        return {}
+    labs_raw = d[c_ivl].astype(str)
+    labs = labs_raw.map(lambda x: _fmt_hhmm(_parse_time_any(x)) if _parse_time_any(x) else None)
+    vals = pd.to_numeric(d.get(val_col), errors="coerce").fillna(0.0)
+    tmp = pd.DataFrame({"lab": labs, "val": vals}).dropna(subset=["lab"]).copy()
+    if tmp.empty:
+        return {}
+    g = tmp.groupby("lab", as_index=True)["val"].sum()
+    return {str(k): float(v) for k, v in g.to_dict().items()}
+
+
+def _infer_window(plan: dict, day: dt.date, ch: str, sk: str) -> Tuple[str, Optional[str]]:
+    def _window_from(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str]]:
+        try:
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                return None, None
+            d = df.copy(); L = {str(c).strip().lower(): c for c in d.columns}
+            c_date = L.get("date") or L.get("day"); ivc = _pick_ivl_col(d)
+            if not ivc:
+                return None, None
+            if c_date:
+                d[c_date] = pd.to_datetime(d[c_date], errors="coerce").dt.date
+                d = d[d[c_date].eq(day)]
+            if d.empty:
+                return None, None
+            times = d[ivc].astype(str).map(_parse_time_any).dropna()
+            if times.empty:
+                return None, None
+            tmin = min(times)
+            tmax = max(times)
+            return _fmt_hhmm(tmin), _fmt_hhmm(tmax)
+        except Exception:
+            return None, None
+
+    start = None; end = None
+    try:
+        if ch == "voice":
+            for df in (_assemble_voice(sk, "forecast"), _assemble_voice(sk, "actual")):
+                s, e = _window_from(df)
+                start = start or s; end = end or e
+        elif ch == "chat":
+            for key in ("chat_forecast_volume", "chat_actual_volume"):
+                df = _load_ts_with_fallback(key, sk)
+                s, e = _window_from(df)
+                start = start or s; end = end or e
+        elif ch in ("outbound", "ob"):
+            for key in (
+                "ob_forecast_opc","outbound_forecast_opc","ob_actual_opc","outbound_actual_opc",
+                "ob_forecast_dials","outbound_forecast_dials","ob_actual_dials","outbound_actual_dials",
+                "ob_forecast_calls","outbound_forecast_calls","ob_actual_calls","outbound_actual_calls",
+            ):
+                df = _load_ts_with_fallback(key, sk)
+                s, e = _window_from(df)
+                start = start or s; end = end or e
+    except Exception:
+        start, end = None, None
+    # Fallback: roster window
+    if not start or not end:
+        try:
+            rl = load_roster_long()
+        except Exception:
+            rl = pd.DataFrame()
+        if isinstance(rl, pd.DataFrame) and not rl.empty:
+            df = rl.copy()
+            def _col(opts):
+                for c in opts:
+                    if c in df.columns:
+                        return c
+                return None
+            c_ba  = _col(["Business Area","business area","vertical"]) 
+            c_sba = _col(["Sub Business Area","sub business area","sub_ba"]) 
+            c_lob = _col(["LOB","lob","Channel","channel"]) 
+            c_site= _col(["Site","site","Location","location","Country","country"]) 
+            BA  = plan.get("vertical"); SBA = plan.get("sub_ba"); LOB = (plan.get("channel") or plan.get("lob") or "").split(",")[0].strip()
+            SITE= (plan.get("site") or plan.get("location") or plan.get("country") or "").strip()
+            def _match(series, val):
+                if not val or not isinstance(series, pd.Series):
+                    return pd.Series(True, index=series.index)
+                s = series.astype(str).str.strip().str.lower()
+                return s.eq(str(val).strip().lower())
+            msk = pd.Series(True, index=df.index)
+            if c_ba:  msk &= _match(df[c_ba], BA)
+            if c_sba and (SBA not in (None, "")): msk &= _match(df[c_sba], SBA)
+            if c_lob: msk &= _match(df[c_lob], LOB)
+            if c_site and (SITE not in (None, "")): msk &= _match(df[c_site], SITE)
+            df = df[msk]
+            if "date" in df.columns:
+                df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+                df = df[df["date"].eq(day)]
+            times: List[dt.time] = []
+            if "entry" in df.columns:
+                for s in df["entry"].astype(str):
+                    m = re.match(r"^(\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM|am|pm)?)\s*-\s*(\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM|am|pm)?)$", s)
+                    if not m:
+                        continue
+                    t1 = _parse_time_any(m.group(1)); t2 = _parse_time_any(m.group(2))
+                    if t1: times.append(t1)
+                    if t2: times.append(t2)
+            if times:
+                tmin = min(times); tmax = max(times)
+                if not start: start = _fmt_hhmm(tmin)
+                if not end:   end   = _fmt_hhmm(tmax)
+    return (start or "08:00"), end
+
+
+def _staff_by_slot_for_day(plan: dict, day: dt.date, ivl_ids: List[str], start_hhmm: str, ivl_min: int) -> Dict[str, float]:
+    try:
+        rl = load_roster_long()
+    except Exception:
+        return {lab: 0.0 for lab in ivl_ids}
+    if not isinstance(rl, pd.DataFrame) or rl.empty:
+        return {lab: 0.0 for lab in ivl_ids}
+    df = rl.copy()
+    def _col(opts):
+        for c in opts:
+            if c in df.columns:
+                return c
+        return None
+    c_ba  = _col(["Business Area","business area","vertical"]) 
+    c_sba = _col(["Sub Business Area","sub business area","sub_ba"]) 
+    c_lob = _col(["LOB","lob","Channel","channel"]) 
+    c_site= _col(["Site","site","Location","location","Country","country"]) 
+    BA  = plan.get("vertical"); SBA = plan.get("sub_ba"); LOB = (plan.get("channel") or plan.get("lob") or "").split(",")[0].strip()
+    SITE= (plan.get("site") or plan.get("location") or plan.get("country") or "").strip()
+    def _match(series, val):
+        if not val or not isinstance(series, pd.Series):
+            return pd.Series(True, index=series.index)
+        s = series.astype(str).str.strip().str.lower()
+        return s.eq(str(val).strip().lower())
+    msk = pd.Series(True, index=df.index)
+    if c_ba:  msk &= _match(df[c_ba], BA)
+    if c_sba and (SBA not in (None, "")): msk &= _match(df[c_sba], SBA)
+    if c_lob: msk &= _match(df[c_lob], LOB)
+    if c_site and (SITE not in (None, "")): msk &= _match(df[c_site], SITE)
+    df = df[msk]
+    if "is_leave" in df.columns:
+        df = df[~df["is_leave"].astype(bool)]
+    if "date" not in df.columns or "entry" not in df.columns:
+        return {lab: 0.0 for lab in ivl_ids}
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+    df = df[df["date"].eq(day)]
+    slots = {lab: 0.0 for lab in ivl_ids}
+    if df.empty:
+        return slots
+    def _parse_hhmm_to_min(hhmm: str) -> int:
+        try:
+            h, m = hhmm.split(":", 1)
+            return int(h) * 60 + int(m)
+        except Exception:
+            return 0
+    cov_start_min = _parse_hhmm_to_min(start_hhmm)
+    for _, rr in df.iterrows():
+        try:
+            sft = str(rr.get("entry", "")).strip()
+            m = re.match(r"^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$", sft)
+            if not m:
+                continue
+            sh, sm, eh, em = map(int, m.groups())
+            sh = min(23, max(0, sh)); eh = min(24, max(0, eh))
+            start_min = sh*60 + sm
+            end_min   = eh*60 + em
+            if end_min <= start_min:
+                end_min += 24*60
+            for idx2, lab2 in enumerate(ivl_ids):
+                slot_abs = cov_start_min + idx2*ivl_min
+                slot_rel = slot_abs
+                if slot_rel < start_min:
+                    slot_rel += 24*60
+                if start_min <= slot_rel < end_min:
+                    slots[lab2] = slots.get(lab2, 0.0) + 1.0
+        except Exception:
+            continue
+    return slots
+
+
+def _erlang_c(A: float, N: int) -> float:
+    if N <= 0:
+        return 1.0
+    if A <= 0:
+        return 0.0
+    if A >= N:
+        return 1.0
+    term = 1.0; ssum = term
+    for k in range(1, N):
+        term *= A / k
+        ssum += term
+    term *= A / N
+    last = term * (N / (N - A))
+    denom = ssum + last
+    if denom <= 0:
+        return 1.0
+    p0 = 1.0 / denom
+    return last * p0
+
+
+def _erlang_sl(calls: float, aht: float, agents: float, ivl_sec: float, T_sec: float) -> float:
+    if aht <= 0 or ivl_sec <= 0 or agents <= 0:
+        return 0.0
+    if calls <= 0:
+        return 1.0
+    A = (calls * aht) / ivl_sec
+    pw = _erlang_c(A, int(max(1, math.floor(agents))))
+    return max(0.0, min(1.0, 1.0 - pw * math.exp(-max(0.0, (agents - A)) * (T_sec / max(1.0, aht)))))
+
+
+def _make_upper_table(df: pd.DataFrame, ivl_cols: List[dict]):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        df = pd.DataFrame({"metric": []})
+    return dash_table.DataTable(
+        id="tbl-upper",
+        data=df.to_dict("records"),
+        columns=[{"name": "Metric", "id": "metric", "editable": False}] + [
+            {"name": c["name"], "id": c["id"]} for c in ivl_cols if c["id"] != "metric"
+        ],
+        editable=False,
+        style_as_list_view=True,
+        style_table={"overflowX": "auto"},
+        style_header={"whiteSpace": "pre"},
+    )
+
+
+def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None, ivl_min: int = 30, sel_date: Optional[str] = None):
+    """Interval view (data-first):
+    - Render FW intervals exactly as uploaded for the selected date
+    - Compute Upper (PHC/SL) and FW Occupancy via Erlang using uploaded intervals + roster
+    - Other grids are left empty (or can be loaded from persistence by callers)
+    """
+    plan = get_plan(pid) or {}
+    # pick representative date
+    if sel_date:
+        try:
+            ref_day = pd.to_datetime(sel_date).date()
+        except Exception:
+            ref_day = dt.date.today()
+    else:
+        ref_day = dt.date.today()
+
+    ch = (plan.get("channel") or plan.get("lob") or "").split(",")[0].strip().lower()
+    sk = _canon_scope(
+        plan.get("vertical"),
+        plan.get("sub_ba"),
+        ch,
+        (plan.get("site") or plan.get("location") or plan.get("country") or "").strip(),
+    )
+    settings = resolve_settings(ba=plan.get("vertical"), subba=plan.get("sub_ba"), lob=ch)
+
+    start_hhmm, end_hhmm = _infer_window(plan, ref_day, ch, sk)
+    ivl_cols, ivl_ids = interval_cols_for_day(ref_day, ivl_min=ivl_min, start_hhmm=start_hhmm, end_hhmm=end_hhmm)
+    cols = ivl_ids  # backward compat alias
+
+    # FW metrics
+    # Shape FW rows to match weekly view spec (fields/ordering), falling back to defaults
+    fw_metrics: List[str] = []
+    try:
+        weeks = _week_span(plan.get("start_week"), plan.get("end_week"))
+        weekly_fw_cols = [{"name": "Metric", "id": "metric", "editable": False}] + [{"name": w, "id": w} for w in weeks]
+        weekly = _fill_tables_fixed(ptype, pid, weekly_fw_cols, _tick, whatif=whatif, grain='week')
+        (_upper_w, fw_w, *_rest) = weekly
+        fw_df = pd.DataFrame(fw_w or [])
+        if isinstance(fw_df, pd.DataFrame) and not fw_df.empty and "metric" in fw_df.columns:
+            fw_metrics = fw_df["metric"].astype(str).tolist()
+    except Exception:
+        fw_metrics = []
+    if not fw_metrics:
+        fw_metrics = ["Forecast","Tactical Forecast","Actual Volume","Forecast AHT/SUT","Actual AHT/SUT","Occupancy"]
+    fw_i = pd.DataFrame({"metric": fw_metrics})
+    for lab in ivl_ids:
+        fw_i[lab] = np.nan
+
+    # Upper rows shaped to match weekly Upper spec (fields/ordering)
+    upper_rows: List[str] = [
+        "FTE Required @ Forecast Volume",
+        "FTE Required @ Actual Volume",
+        "Projected Handling Capacity (#)",
+        "Projected Service Level",
+    ]
+    try:
+        # Reuse weekly call above to pick weekly upper spec
+        weeks = _week_span(plan.get("start_week"), plan.get("end_week"))
+        weekly_fw_cols = [{"name": "Metric", "id": "metric", "editable": False}] + [{"name": w, "id": w} for w in weeks]
+        weekly = _fill_tables_fixed(ptype, pid, weekly_fw_cols, _tick, whatif=whatif, grain='week')
+        (upper_wk, *_rest) = weekly
+        upper_df_w = pd.DataFrame(getattr(upper_wk, 'data', None) or [])
+        if isinstance(upper_df_w, pd.DataFrame) and not upper_df_w.empty and "metric" in upper_df_w.columns:
+            upper_rows = upper_df_w["metric"].astype(str).tolist()
+    except Exception:
+        pass
+    upper = pd.DataFrame({"metric": upper_rows})
+    for lab in ivl_ids:
+        upper[lab] = 0.0
+
+    ivl_sec = max(60, int(ivl_min) * 60)
+    T_sec = float(settings.get("sl_seconds", 20) or 20.0)
+    target_sl = float(settings.get("target_sl", 0.8) or 0.8)
+
+    # Channel-specific fills
+    if ch == "voice":
+        vF = _assemble_voice(sk, "forecast"); vA = _assemble_voice(sk, "actual"); vT = _assemble_voice(sk, "tactical")
+        volF = _slot_series_for_day(vF, ref_day, "volume")
+        volA = _slot_series_for_day(vA if isinstance(vA, pd.DataFrame) and not vA.empty else vF, ref_day, "volume")
+        volT = _slot_series_for_day(vT, ref_day, "volume")
+        ahtF = _slot_series_for_day(vF, ref_day, "aht_sec")
+        ahtA = _slot_series_for_day(vA, ref_day, "aht_sec")
+        # Budgeted AHT for week of ref_day, if provided
+        ahtB_val = None
+        try:
+            dfp = _load_ts_with_fallback("voice_planned_aht", sk)
+        except Exception:
+            dfp = pd.DataFrame()
+        if isinstance(dfp, pd.DataFrame) and not dfp.empty:
+            d = dfp.copy()
+            if "week" in d.columns:
+                d["week"] = pd.to_datetime(d["week"], errors="coerce").dt.date
+            elif "date" in d.columns:
+                d["week"] = pd.to_datetime(d["date"], errors="coerce").dt.date
+            refw = (pd.to_datetime(ref_day).date() - dt.timedelta(days=ref_day.weekday()))
+            dd = d[pd.to_datetime(d["week"], errors="coerce").dt.date.eq(refw)]
+            for c in ("aht_sec","aht","avg_aht"):
+                if c in dd.columns:
+                    v = pd.to_numeric(dd[c], errors="coerce").dropna()
+                    if not v.empty:
+                        ahtB_val = float(v.iloc[-1]); break
+        if ahtB_val is None:
+            try:
+                dfb = _load_ts_with_fallback("voice_budget", sk)
+            except Exception:
+                dfb = pd.DataFrame()
+            if isinstance(dfb, pd.DataFrame) and not dfb.empty:
+                d = dfb.copy()
+                if "week" in d.columns:
+                    d["week"] = pd.to_datetime(d["week"], errors="coerce").dt.date
+                elif "date" in d.columns:
+                    d["week"] = pd.to_datetime(d["date"], errors="coerce").dt.date
+                refw = (pd.to_datetime(ref_day).date() - dt.timedelta(days=ref_day.weekday()))
+                dd = d[pd.to_datetime(d["week"], errors="coerce").dt.date.eq(refw)]
+                for c in ("budget_aht_sec","aht_sec","aht"):
+                    if c in dd.columns:
+                        v = pd.to_numeric(dd[c], errors="coerce").dropna()
+                        if not v.empty:
+                            ahtB_val = float(v.iloc[-1]); break
+        mser = fw_i["metric"].astype(str)
+        for lab in ivl_ids:
+            if lab in volF and "Forecast" in mser.values:
+                fw_i.loc[mser == "Forecast", lab] = float(volF[lab])
+            if lab in volT and "Tactical Forecast" in mser.values:
+                fw_i.loc[mser == "Tactical Forecast", lab] = float(volT[lab])
+            if lab in volA and "Actual Volume" in mser.values:
+                fw_i.loc[mser == "Actual Volume", lab] = float(volA[lab])
+            if lab in ahtF and "Forecast AHT/SUT" in mser.values:
+                fw_i.loc[mser == "Forecast AHT/SUT", lab] = float(ahtF[lab])
+            if lab in ahtA and "Actual AHT/SUT" in mser.values:
+                fw_i.loc[mser == "Actual AHT/SUT", lab] = float(ahtA[lab])
+            if ahtB_val is not None and "Budgeted AHT/SUT" in mser.values:
+                fw_i.loc[mser == "Budgeted AHT/SUT", lab] = float(ahtB_val)
+        # Staffing and Erlang rollups
+        staff = _staff_by_slot_for_day(plan, ref_day, ivl_ids, start_hhmm, ivl_min)
+        occ_cap = float(settings.get("occupancy_cap_voice", 0.85) or 0.85)
+        for lab in ivl_ids:
+            ag = float(staff.get(lab, 0.0) or 0.0)
+            calls = float(volF.get(lab, 0.0))
+            aht = float(ahtF.get(lab, ahtF.get(next(iter(ahtF), lab), 300.0)) or 300.0)
+            # FTE Required rows (agents per interval)
+            if calls > 0 and aht > 0:
+                Nf, _slN, _occN, _asaN = min_agents(calls, aht, ivl_min, target_sl, T_sec, occ_cap)
+                upper.loc[upper["metric"].eq("FTE Required @ Forecast Volume"), lab] = float(Nf)
+            calls_a = float(volA.get(lab, 0.0))
+            aht_a = float(ahtA.get(lab, aht))
+            if calls_a > 0 and aht_a > 0:
+                Na, _slNa, _occNa, _asaNa = min_agents(calls_a, aht_a, ivl_min, target_sl, T_sec, occ_cap)
+                upper.loc[upper["metric"].eq("FTE Required @ Actual Volume"), lab] = float(Na)
+            # Over/Under rows
+            if (upper["metric"].astype(str) == "FTE Over/Under (#)").any():
+                req = (Na if (calls_a > 0 and aht_a > 0) else (Nf if (calls > 0 and aht > 0) else 0.0))
+                upper.loc[upper["metric"].eq("FTE Over/Under (#)"), lab] = float(ag) - float(req)
+            if (upper["metric"].astype(str) == "FTE Over/Under MTP Vs Actual").any() and (calls > 0 or calls_a > 0):
+                base = Na if (calls_a > 0 and aht_a > 0) else 0.0
+                val = (Nf if (calls > 0 and aht > 0) else 0.0) - float(base)
+                upper.loc[upper["metric"].eq("FTE Over/Under MTP Vs Actual"), lab] = float(val)
+            if (upper["metric"].astype(str) == "FTE Over/Under Tactical Vs Actual").any() and lab in volT:
+                calls_t = float(volT.get(lab, 0.0))
+                if calls_t > 0 and aht > 0:
+                    Nt, _slT, _occT, _asaT = min_agents(calls_t, aht, ivl_min, target_sl, T_sec, occ_cap)
+                    base = Na if (calls_a > 0 and aht_a > 0) else 0.0
+                    upper.loc[upper["metric"].eq("FTE Over/Under Tactical Vs Actual"), lab] = float(Nt) - float(base)
+            if (upper["metric"].astype(str) == "FTE Over/Under Budgeted Vs Actual").any() and ahtB_val:
+                base = Na if (calls_a > 0 and aht_a > 0) else 0.0
+                Nb, _slB, _occB, _asaB = min_agents(calls, float(ahtB_val), ivl_min, target_sl, T_sec, occ_cap) if calls > 0 else (0.0,0,0,0)
+                upper.loc[upper["metric"].eq("FTE Over/Under Budgeted Vs Actual"), lab] = float(Nb) - float(base)
+            # Projected Supply HC
+            if (upper["metric"].astype(str) == "Projected Supply HC").any():
+                upper.loc[upper["metric"].eq("Projected Supply HC"), lab] = float(ag)
+            cap = 0.0; sl = 0.0
+            if aht > 0 and ivl_sec > 0:
+                # capacity at target SL via search with occupancy cap
+                # simple monotone search up to occupancy cap-limited calls
+                # occupancy-limited calls:
+                occ_calls = (occ_cap * ag * ivl_sec) / max(1.0, aht)
+                # binary search for SL target
+                lo, hi = 0, int(max(1, (ag * ivl_sec) / max(1.0, aht)))
+                if _erlang_sl(hi, aht, ag, ivl_sec, T_sec) < target_sl:
+                    cap = float(min(hi, occ_calls))
+                else:
+                    while _erlang_sl(hi, aht, ag, ivl_sec, T_sec) >= target_sl and hi < 10_000_000:
+                        lo = hi; hi *= 2
+                    while lo < hi:
+                        mid = (lo + hi + 1) // 2
+                        if _erlang_sl(mid, aht, ag, ivl_sec, T_sec) >= target_sl:
+                            lo = mid
+                        else:
+                            hi = mid - 1
+                    cap = float(min(lo, occ_calls))
+                sl = 100.0 * _erlang_sl(calls, aht, ag, ivl_sec, T_sec)
+            upper.loc[upper["metric"].eq("Projected Handling Capacity (#)"), lab] = cap
+            upper.loc[upper["metric"].eq("Projected Service Level"), lab] = sl
+            # FW Occupancy
+            A = (calls * aht) / ivl_sec if aht > 0 and ivl_sec > 0 else 0.0
+            occ = 100.0 * min(occ_cap, (A / max(ag, 1e-6)) if ag > 0 else 0.0)
+            if "Occupancy" in mser.values:
+                fw_i.loc[mser == "Occupancy", lab] = occ
+
+    elif ch == "chat":
+        cF = _assemble_chat(sk, "forecast"); cA = _assemble_chat(sk, "actual"); cT = _assemble_chat(sk, "tactical")
+        volF_map = _slot_series_for_day(cF, ref_day, "items") or _slot_series_for_day(cF, ref_day, "volume")
+        volA_map = _slot_series_for_day(cA if isinstance(cA, pd.DataFrame) and not cA.empty else cF, ref_day, "items")
+        volT_map = _slot_series_for_day(cT, ref_day, "items") or {}
+        aht_map  = _slot_series_for_day(cF, ref_day, "aht_sec") or _slot_series_for_day(cF, ref_day, "aht")
+        mser = fw_i["metric"].astype(str)
+        for lab in ivl_ids:
+            if lab in volF_map and "Forecast" in mser.values:
+                fw_i.loc[mser == "Forecast", lab] = float(volF_map[lab])
+            if lab in volT_map and "Tactical Forecast" in mser.values:
+                fw_i.loc[mser == "Tactical Forecast", lab] = float(volT_map[lab])
+            if lab in volA_map and "Actual Volume" in mser.values:
+                fw_i.loc[mser == "Actual Volume", lab] = float(volA_map[lab])
+            if lab in aht_map and "Forecast AHT/SUT" in mser.values:
+                fw_i.loc[mser == "Forecast AHT/SUT", lab] = float(aht_map[lab])
+        staff = _staff_by_slot_for_day(plan, ref_day, ivl_ids, start_hhmm, ivl_min)
+        ivl_sec = max(60, int(ivl_min) * 60)
+        T_sec = float(settings.get("chat_sl_seconds", settings.get("sl_seconds", 20)) or 20.0)
+        target_sl = float(settings.get("chat_target_sl", settings.get("target_sl", 0.8)) or 0.8)
+        occ_cap = float(settings.get("occupancy_cap_chat", settings.get("util_chat", settings.get("occupancy_cap_voice", 0.85))) or 0.85)
+        conc = float(settings.get("chat_concurrency", 1.5) or 1.0)
+        for lab in ivl_ids:
+            ag = float(staff.get(lab, 0.0) or 0.0)
+            items = float(volF_map.get(lab, 0.0))
+            aht = float(aht_map.get(lab, aht_map.get(next(iter(aht_map), lab), 240.0)) or 240.0) / max(0.1, conc)
+            # FTE Required rows (agents per interval) using effective AHT
+            if items > 0 and aht > 0:
+                Nf, _slN, _occN, _asaN = min_agents(items, aht, ivl_min, target_sl, T_sec, occ_cap)
+                upper.loc[upper["metric"].eq("FTE Required @ Forecast Volume"), lab] = float(Nf)
+            items_a = float(volA_map.get(lab, 0.0))
+            if items_a > 0 and aht > 0:
+                Na, _slNa, _occNa, _asaNa = min_agents(items_a, aht, ivl_min, target_sl, T_sec, occ_cap)
+                upper.loc[upper["metric"].eq("FTE Required @ Actual Volume"), lab] = float(Na)
+            # Deltas vs actual + supply row
+            if (upper["metric"].astype(str) == "FTE Over/Under MTP Vs Actual").any() and (items > 0 or items_a > 0):
+                base = Na if items_a > 0 else 0.0
+                upper.loc[upper["metric"].eq("FTE Over/Under MTP Vs Actual"), lab] = float(Nf if items > 0 else 0.0) - float(base)
+            if (upper["metric"].astype(str) == "FTE Over/Under Tactical Vs Actual").any() and lab in volT_map:
+                it = float(volT_map.get(lab, 0.0))
+                if it > 0 and aht > 0:
+                    Nt, _slT, _occT, _asaT = min_agents(it, aht, ivl_min, target_sl, T_sec, occ_cap)
+                    base = Na if items_a > 0 else 0.0
+                    upper.loc[upper["metric"].eq("FTE Over/Under Tactical Vs Actual"), lab] = float(Nt) - float(base)
+            if (upper["metric"].astype(str) == "FTE Over/Under Budgeted Vs Actual").any():
+                # No separate budget for Chat; use Forecast requirement as proxy
+                base = Na if items_a > 0 else 0.0
+                upper.loc[upper["metric"].eq("FTE Over/Under Budgeted Vs Actual"), lab] = float(Nf if items > 0 else 0.0) - float(base)
+            if (upper["metric"].astype(str) == "Projected Supply HC").any():
+                upper.loc[upper["metric"].eq("Projected Supply HC"), lab] = float(ag)
+            # Over/Under if row present
+            if (upper["metric"].astype(str) == "FTE Over/Under (#)").any():
+                req = (Na if (items_a > 0 and aht > 0) else (Nf if (items > 0 and aht > 0) else 0.0))
+                upper.loc[upper["metric"].eq("FTE Over/Under (#)"), lab] = float(ag) - float(req)
+            # capacity search (as voice)
+            occ_calls = (occ_cap * ag * ivl_sec) / max(1.0, aht)
+            lo, hi = 0, int(max(1, (ag * ivl_sec) / max(1.0, aht)))
+            if _erlang_sl(hi, aht, ag, ivl_sec, T_sec) < target_sl:
+                cap = float(min(hi, occ_calls))
+            else:
+                while _erlang_sl(hi, aht, ag, ivl_sec, T_sec) >= target_sl and hi < 10_000_000:
+                    lo = hi; hi *= 2
+                while lo < hi:
+                    mid = (lo + hi + 1) // 2
+                    if _erlang_sl(mid, aht, ag, ivl_sec, T_sec) >= target_sl:
+                        lo = mid
+                    else:
+                        hi = mid - 1
+                cap = float(min(lo, occ_calls))
+            sl = 100.0 * _erlang_sl(items, aht, ag, ivl_sec, T_sec)
+            upper.loc[upper["metric"].eq("Projected Handling Capacity (#)"), lab] = cap
+            upper.loc[upper["metric"].eq("Projected Service Level"), lab] = sl
+            A = (items * aht) / ivl_sec if aht > 0 and ivl_sec > 0 else 0.0
+            occ = 100.0 * min(occ_cap, (A / max(ag, 1e-6)) if ag > 0 else 0.0)
+            if "Occupancy" in mser.values:
+                fw_i.loc[mser == "Occupancy", lab] = occ
+
+    elif ch in ("outbound", "ob"):
+        oF = _assemble_ob(sk, "forecast"); oA = _assemble_ob(sk, "actual"); oT = _assemble_ob(sk, "tactical")
+        volF = _slot_series_for_day(oF, ref_day, "opc") or _slot_series_for_day(oF, ref_day, "dials") or _slot_series_for_day(oF, ref_day, "calls") or _slot_series_for_day(oF, ref_day, "volume")
+        volA = _slot_series_for_day(oA, ref_day, "opc") or _slot_series_for_day(oA, ref_day, "dials") or _slot_series_for_day(oA, ref_day, "calls") or _slot_series_for_day(oA, ref_day, "volume")
+        volT = _slot_series_for_day(oT, ref_day, "opc") or {}
+        aht_map = _slot_series_for_day(oF, ref_day, "aht_sec") or _slot_series_for_day(oF, ref_day, "aht")
+        mser = fw_i["metric"].astype(str)
+        for lab in ivl_ids:
+            if lab in volF and "Forecast" in mser.values:
+                fw_i.loc[mser == "Forecast", lab] = float(volF[lab])
+            if lab in volT and "Tactical Forecast" in mser.values:
+                fw_i.loc[mser == "Tactical Forecast", lab] = float(volT[lab])
+            if lab in volA and "Actual Volume" in mser.values:
+                fw_i.loc[mser == "Actual Volume", lab] = float(volA[lab])
+            if lab in aht_map and "Forecast AHT/SUT" in mser.values:
+                fw_i.loc[mser == "Forecast AHT/SUT", lab] = float(aht_map[lab])
+        staff = _staff_by_slot_for_day(plan, ref_day, ivl_ids, start_hhmm, ivl_min)
+        ivl_sec = max(60, int(ivl_min) * 60)
+        T_sec = float(settings.get("ob_sl_seconds", settings.get("sl_seconds", 20)) or 20.0)
+        target_sl = float(settings.get("ob_target_sl", settings.get("target_sl", 0.8)) or 0.8)
+        occ_cap = float(settings.get("occupancy_cap_ob", settings.get("util_ob", settings.get("occupancy_cap_voice", 0.85))) or 0.85)
+        for lab in ivl_ids:
+            ag = float(staff.get(lab, 0.0) or 0.0)
+            calls = float(volF.get(lab, 0.0))
+            aht = float(aht_map.get(lab, aht_map.get(next(iter(aht_map), lab), 240.0)) or 240.0)
+            # FTE Required rows (agents per interval)
+            if calls > 0 and aht > 0:
+                Nf, _slN, _occN, _asaN = min_agents(calls, aht, ivl_min, target_sl, T_sec, occ_cap)
+                upper.loc[upper["metric"].eq("FTE Required @ Forecast Volume"), lab] = float(Nf)
+            calls_a = float(volA.get(lab, 0.0))
+            if calls_a > 0 and aht > 0:
+                Na, _slNa, _occNa, _asaNa = min_agents(calls_a, aht, ivl_min, target_sl, T_sec, occ_cap)
+                upper.loc[upper["metric"].eq("FTE Required @ Actual Volume"), lab] = float(Na)
+            # Deltas vs actual + supply row
+            if (upper["metric"].astype(str) == "FTE Over/Under MTP Vs Actual").any() and (calls > 0 or calls_a > 0):
+                base = Na if calls_a > 0 else 0.0
+                upper.loc[upper["metric"].eq("FTE Over/Under MTP Vs Actual"), lab] = float(Nf if calls > 0 else 0.0) - float(base)
+            if (upper["metric"].astype(str) == "FTE Over/Under Tactical Vs Actual").any() and lab in volT:
+                ct = float(volT.get(lab, 0.0))
+                if ct > 0 and aht > 0:
+                    Nt, _slT, _occT, _asaT = min_agents(ct, aht, ivl_min, target_sl, T_sec, occ_cap)
+                    base = Na if calls_a > 0 else 0.0
+                    upper.loc[upper["metric"].eq("FTE Over/Under Tactical Vs Actual"), lab] = float(Nt) - float(base)
+            if (upper["metric"].astype(str) == "FTE Over/Under Budgeted Vs Actual").any():
+                # No separate budget feed for Outbound; use Forecast requirement as proxy
+                base = Na if calls_a > 0 else 0.0
+                upper.loc[upper["metric"].eq("FTE Over/Under Budgeted Vs Actual"), lab] = float(Nf if calls > 0 else 0.0) - float(base)
+            if (upper["metric"].astype(str) == "Projected Supply HC").any():
+                upper.loc[upper["metric"].eq("Projected Supply HC"), lab] = float(ag)
+            # Over/Under if row present
+            if (upper["metric"].astype(str) == "FTE Over/Under (#)").any():
+                req = (Na if (calls_a > 0 and aht > 0) else (Nf if (calls > 0 and aht > 0) else 0.0))
+                upper.loc[upper["metric"].eq("FTE Over/Under (#)"), lab] = float(ag) - float(req)
+            # capacity & SL
+            occ_calls = (occ_cap * ag * ivl_sec) / max(1.0, aht)
+            lo, hi = 0, int(max(1, (ag * ivl_sec) / max(1.0, aht)))
+            if _erlang_sl(hi, aht, ag, ivl_sec, T_sec) < target_sl:
+                cap = float(min(hi, occ_calls))
+            else:
+                while _erlang_sl(hi, aht, ag, ivl_sec, T_sec) >= target_sl and hi < 10_000_000:
+                    lo = hi; hi *= 2
+                while lo < hi:
+                    mid = (lo + hi + 1) // 2
+                    if _erlang_sl(mid, aht, ag, ivl_sec, T_sec) >= target_sl:
+                        lo = mid
+                    else:
+                        hi = mid - 1
+                cap = float(min(lo, occ_calls))
+            sl = 100.0 * _erlang_sl(calls, aht, ag, ivl_sec, T_sec)
+            upper.loc[upper["metric"].eq("Projected Handling Capacity (#)"), lab] = cap
+            upper.loc[upper["metric"].eq("Projected Service Level"), lab] = sl
+            A = (calls * aht) / ivl_sec if aht > 0 and ivl_sec > 0 else 0.0
+            occ = 100.0 * min(occ_cap, (A / max(ag, 1e-6)) if ag > 0 else 0.0)
+            if "Occupancy" in mser.values:
+                fw_i.loc[mser == "Occupancy", lab] = occ
+
+    # For future dates, override Occupancy with settings value
+    try:
+        today = pd.Timestamp('today').date()
+        ch_low = str(ch).strip().lower()
+        if isinstance(ref_day, dt.date) and ref_day > today and "metric" in fw_i.columns:
+            m_occ = fw_i["metric"].astype(str).eq("Occupancy")
+            if m_occ.any():
+                if ch_low == 'voice':
+                    base = settings.get('occupancy_cap_voice', settings.get('occupancy', 0.85))
+                elif ch_low == 'chat':
+                    base = settings.get('util_chat', settings.get('util_bo', 0.85))
+                else:
+                    base = settings.get('util_ob', settings.get('occupancy', 0.85))
+                try:
+                    occ_pct = float(base)
+                    if occ_pct <= 1.0:
+                        occ_pct *= 100.0
+                except Exception:
+                    occ_pct = 85.0
+                for lab in ivl_ids:
+                    fw_i.loc[m_occ, lab] = occ_pct
+    except Exception:
+        pass
+
+    # Rounding: 1 decimal for Occupancy, Service Level, and Handling Capacity
+    try:
+        # Round FW Occupancy row to 1 decimal
+        if "metric" in fw_i.columns:
+            m_occ = fw_i["metric"].astype(str).eq("Occupancy")
+            if m_occ.any():
+                for lab in ivl_ids:
+                    vals = pd.to_numeric(fw_i.loc[m_occ, lab], errors="coerce").round(1)
+                    fw_i.loc[m_occ, lab] = vals.astype(str) + "%"
+        # Round upper SL and Capacity rows to 1 decimal
+        if "metric" in upper.columns:
+            for row_name in ["Projected Handling Capacity (#)", "Projected Service Level"]:
+                m = upper["metric"].astype(str).eq(row_name)
+                if m.any():
+                    for lab in ivl_ids:
+                        if row_name == "Projected Service Level":
+                            vals = pd.to_numeric(upper.loc[m, lab], errors="coerce").round(1)
+                            upper.loc[m, lab] = vals.astype(str) + "%"
+                        else:
+                            upper.loc[m, lab] = pd.to_numeric(upper.loc[m, lab], errors="coerce").round(1)
+    except Exception:
+        pass
+
+    # Upper table component
+    upper_tbl = _make_upper_table(upper, ivl_cols)
+
+    # Other tabs: leave empty (callers can persist/load as needed)
+    empty = []
+    return (
+        upper_tbl,
+        fw_i.to_dict("records"),
+        empty, empty, empty, empty, empty, empty, empty, empty,
+        empty, empty, empty,
+    )
