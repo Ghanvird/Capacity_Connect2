@@ -158,6 +158,39 @@ def _scopes_from_datasets(ba, sba, ch, site, loc) -> pd.DataFrame:
     return out[["ba","sba","ch","loc","site","sk"]] if not out.empty else pd.DataFrame(columns=["ba","sba","ch","loc","site","sk"])
 
 
+def _dataset_sites_all() -> list[str]:
+    """Return unique site names from stored dataset scope keys (if present)."""
+    try:
+        with _db_conn() as cx:
+            rows = cx.execute(
+                """
+                SELECT name FROM datasets
+                 WHERE name LIKE 'voice\_%::%'
+                    OR name LIKE 'bo\_%::%'
+                """
+            ).fetchall()
+    except Exception:
+        rows = []
+    sites: set[str] = set()
+    for r in rows or []:
+        name = (r["name"] if isinstance(r, dict) else r[0]) if r else ""
+        if not name or "::" not in name:
+            continue
+        try:
+            _, raw_sk = name.split("::", 1)
+        except ValueError:
+            continue
+        parts = [p.strip() for p in str(raw_sk or "").split("|")]
+        if len(parts) >= 4 and parts[3]:
+            sites.add(parts[3])
+    if not sites:
+        return []
+    # Filter out common country/location synonyms
+    country_block = {"india", "uk", "united kingdom", "great britain", "england", "scotland", "wales"}
+    out = sorted([s for s in sites if s and s.strip().lower() not in country_block])
+    return out
+
+
 def _load_voice(scopes: list[str]) -> pd.DataFrame:
     # Try actual -> forecast -> tactical -> sample
     vol = load_timeseries_any("voice_actual_volume", scopes)
@@ -188,6 +221,14 @@ def _load_voice(scopes: list[str]) -> pd.DataFrame:
                       left_on=[date_v], right_on=[date_a], how="left")
         df = df.rename(columns={date_v: "date"})
         df["interval"] = None
+    # Preserve scope_key if present on either side of the merge
+    skx = next((c for c in df.columns if c.lower() == "scope_key_x"), None)
+    sky = next((c for c in df.columns if c.lower() == "scope_key_y"), None)
+    if skx or sky:
+        df["scope_key"] = df[skx] if skx else None
+        if sky:
+            df["scope_key"] = df["scope_key"].fillna(df[sky])
+        df = df.drop(columns=[c for c in (skx, sky) if c], errors="ignore")
     if "aht_sec" not in df:
         df["aht_sec"] = 300.0
     df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
@@ -216,6 +257,14 @@ def _load_bo(scopes: list[str]) -> pd.DataFrame:
     df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
     if "sut_sec" not in df:
         df["sut_sec"] = 600.0
+    # Preserve scope_key if present on either side
+    skx = next((c for c in df.columns if c.lower() == "scope_key_x"), None)
+    sky = next((c for c in df.columns if c.lower() == "scope_key_y"), None)
+    if skx or sky:
+        df["scope_key"] = df[skx] if skx else None
+        if sky:
+            df["scope_key"] = df["scope_key"].fillna(df[sky])
+        df = df.drop(columns=[c for c in (skx, sky) if c], errors="ignore")
     return df
 
 
@@ -256,6 +305,9 @@ def page_ops():
         and (ls := str(s).strip().lower()) not in loc_set0
         and ls not in country_block
     ]
+    # Fallback: derive site options from dataset keys when HC provides none
+    if not opts_site:
+        opts_site = _dataset_sites_all()
 
     start, end = _today_range(28)
 
@@ -391,7 +443,17 @@ def _dep_site(ba_vals, sba_vals, ch_vals, loc_vals, site_curr):
     country_block = {"india", "uk", "united kingdom", "great britain", "england", "scotland", "wales"}
     site_list = [s for s in site_list if s and (sl := s.strip().lower()) not in loc_set and sl not in country_block]
 
-    opts = [{"label": x, "value": x} for x in site_list]
+    # Fallback to dataset-derived sites when headcount has none
+    if not site_list:
+        ds_map = _scopes_from_datasets(ba_vals, sba_vals, ch_vals, None, loc_vals)
+        if not ds_map.empty and "site" in ds_map.columns:
+            site_list = sorted([s for s in ds_map["site"].astype(str).dropna().str.strip().unique().tolist() if s])
+        # Apply country/location filters similar to above
+        loc_set = set(df["Location"].astype(str).str.strip().str.lower().unique().tolist()) if "Location" in df.columns else set()
+        country_block = {"india", "uk", "united kingdom", "great britain", "england", "scotland", "wales"}
+        site_list = [s for s in site_list if s and (s.strip().lower() not in loc_set) and (s.strip().lower() not in country_block)]
+
+    opts = [{"label": x, "value": x} for x in sorted(site_list)]
     curr = site_curr if isinstance(site_curr, list) else ([site_curr] if site_curr else [])
     new_val = [x for x in curr if x in site_list]
     return opts, new_val
