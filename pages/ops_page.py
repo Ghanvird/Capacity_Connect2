@@ -14,6 +14,7 @@ from cap_store import (
     load_roster, load_hiring, resolve_settings
 )
 from common import _hcu_df, _hcu_cols, CHANNEL_LIST
+from cap_db import _conn as _db_conn
 from capacity_core import required_fte_daily, voice_requirements_interval, make_voice_sample, make_backoffice_sample, supply_fte_daily
 
 
@@ -26,11 +27,9 @@ def _today_range(default_days: int = 28) -> tuple[str, str]:
 def _hc_dim_df() -> pd.DataFrame:
     df = _hcu_df()
     if df is None or df.empty:
-        # Minimal scaffold to avoid empty UI
-        return pd.DataFrame([
-            {"Business Area": "Retail", "Sub Business Area": "Cards", "Channel": "Voice", "Location": "India", "Site": "Chennai"},
-            {"Business Area": "Retail", "Sub Business Area": "Cards", "Channel": "Back Office", "Location": "UK", "Site": "Glasgow"},
-        ])
+        # Return an empty, typed frame rather than dummy rows to avoid
+        # producing fake scope keys that trigger sample data downstream.
+        return pd.DataFrame(columns=["Business Area", "Sub Business Area", "Channel", "Location", "Site"])
     C = _hcu_cols(df)
     cols = {}
     cols["Business Area"] = C.get("ba")
@@ -66,15 +65,14 @@ def _scope_keys_from_filters(ba, sba, ch, site, loc) -> pd.DataFrame:
     _apply("Location", loc)
     if df.empty:
         return pd.DataFrame(columns=["ba","sba","ch","loc","site","sk"])
-    # Determine channel set: selected, else unique from HC, else CHANNEL_LIST
+    # Determine channel set strictly from defaults unless user explicitly selects
     if ch:
         if isinstance(ch, list):
             ch_list = [str(x).strip() for x in ch if str(x).strip()]
         else:
             ch_list = [str(ch).strip()]
     else:
-        uniq = sorted([x for x in df["Channel"].astype(str).str.strip().unique().tolist() if x])
-        ch_list = uniq or list(CHANNEL_LIST)
+        ch_list = list(CHANNEL_LIST)
 
     rows = []
     for _, r in df.iterrows():
@@ -88,6 +86,76 @@ def _scope_keys_from_filters(ba, sba, ch, site, loc) -> pd.DataFrame:
     out = pd.DataFrame(rows)
     out = out.drop_duplicates(subset=["sk","site","loc"]) if not out.empty else out
     return out[["ba","sba","ch","loc","site","sk"]]
+
+
+def _scopes_from_datasets(ba, sba, ch, site, loc) -> pd.DataFrame:
+    """Fallback: derive available scopes from stored datasets when HC is absent/misaligned.
+    Returns DataFrame columns [ba,sba,ch,loc,site,sk] where sk preserves the raw
+    stored scope key (3-part or 4-part) enabling exact matches and site mapping.
+    """
+    try:
+        with _db_conn() as cx:
+            rows = cx.execute(
+                """
+                SELECT name FROM datasets
+                 WHERE name LIKE 'voice\_%::%'
+                    OR name LIKE 'bo\_%::%'
+                """
+            ).fetchall()
+    except Exception:
+        rows = []
+
+    scope_keys: list[str] = []
+    for r in rows or []:
+        name = (r["name"] if isinstance(r, dict) else r[0]) if r else ""
+        if not name or "::" not in name:
+            continue
+        try:
+            _, raw_sk = name.split("::", 1)
+        except ValueError:
+            continue
+        raw_sk = str(raw_sk or "").strip()
+        if not raw_sk:
+            continue
+        scope_keys.append(raw_sk)
+
+    if not scope_keys:
+        return pd.DataFrame(columns=["ba","sba","ch","loc","site","sk"])
+
+    rows_out = []
+    # Normalize filters into sets for case-insensitive match
+    def _norm_list(x):
+        if not x:
+            return set()
+        if isinstance(x, list):
+            return {str(v).strip().lower() for v in x if str(v).strip()}
+        return {str(x).strip().lower()}
+
+    ba_f = _norm_list(ba); sba_f = _norm_list(sba); ch_f = _norm_list(ch)
+    site_f = _norm_list(site); loc_f = _norm_list(loc)
+
+    for sk in sorted(set(scope_keys)):
+        parts = [p.strip() for p in sk.split("|")]
+        ba_v  = parts[0] if len(parts) > 0 else ""
+        sba_v = parts[1] if len(parts) > 1 else ""
+        ch_v  = parts[2] if len(parts) > 2 else ""
+        site_v= parts[3] if len(parts) > 3 else ""
+        # Apply explicit filters when present
+        if ba_f and ba_v.strip().lower() not in ba_f:
+            continue
+        if sba_f and sba_v.strip().lower() not in sba_f:
+            continue
+        if ch_f and ch_v.strip().lower() not in ch_f:
+            continue
+        if site_f and site_v.strip().lower() not in site_f:
+            continue
+        # No reliable 'loc' in timeseries keys; ignore 'loc' filter here.
+        rows_out.append({
+            "ba": ba_v, "sba": sba_v, "ch": ch_v, "loc": "", "site": site_v, "sk": sk
+        })
+
+    out = pd.DataFrame(rows_out)
+    return out[["ba","sba","ch","loc","site","sk"]] if not out.empty else pd.DataFrame(columns=["ba","sba","ch","loc","site","sk"])
 
 
 def _load_voice(scopes: list[str]) -> pd.DataFrame:
@@ -176,8 +244,8 @@ def page_ops():
     opts_ba = sorted(m["Business Area"].astype(str).dropna().unique().tolist())
     opts_sba = sorted(m["Sub Business Area"].astype(str).dropna().unique().tolist())
     opts_loc = sorted(m["Location"].astype(str).dropna().unique().tolist())
-    # Channels (fallback to default list)
-    opts_ch = sorted([x for x in m["Channel"].astype(str).dropna().unique().tolist() if x]) or list(CHANNEL_LIST)
+    # Channels: always use fixed defaults (do not derive from HC)
+    opts_ch = list(CHANNEL_LIST)
     # Site options minus any values equal to Location or known country synonyms
     raw_sites = sorted([x for x in m["Site"].astype(str).dropna().unique().tolist() if x]) if "Site" in m.columns else []
     loc_set0 = {str(x).strip().lower() for x in opts_loc}
@@ -285,18 +353,12 @@ def _dep_sba(ba_vals, sba_curr):
     prevent_initial_call=False
 )
 def _dep_channel(ba_vals, sba_vals, ch_curr):
-    m = _hc_dim_df(); df = m.copy()
-    if ba_vals:
-        sel_ba = {str(x).strip().lower() for x in (ba_vals if isinstance(ba_vals, list) else [ba_vals])}
-        df = df[df["Business Area"].astype(str).str.strip().str.lower().isin(sel_ba)]
-    if sba_vals:
-        sel_sba = {str(x).strip().lower() for x in (sba_vals if isinstance(sba_vals, list) else [sba_vals])}
-        df = df[df["Sub Business Area"].astype(str).str.strip().str.lower().isin(sel_sba)]
+    # Always present the fixed channel list; keep current selections if valid
     try:
         from common import CHANNEL_LIST as _CHAN
     except Exception:
         _CHAN = ["Voice", "Back Office", "Outbound", "Blended", "Chat", "MessageUs"]
-    ch_list = sorted(df["Channel"].astype(str).dropna().unique().tolist()) or list(_CHAN)
+    ch_list = list(_CHAN)
     opts = [{"label": x, "value": x} for x in ch_list]
     curr = ch_curr if isinstance(ch_curr, list) else ([ch_curr] if ch_curr else [])
     new_val = [x for x in curr if x in ch_list]
@@ -361,6 +423,9 @@ def _refresh_ops(s, e, grain, ba, sba, ch, site, loc):
         start, end = date.today() - timedelta(days=28), date.today()
 
     map_df = _scope_keys_from_filters(ba, sba, ch, site, loc)
+    if map_df.empty:
+        # Fallback to dataset-derived scopes when HC provides no mapping
+        map_df = _scopes_from_datasets(ba, sba, ch, site, loc)
     scopes = map_df["sk"].unique().tolist()
 
     voice = _load_voice(scopes)
@@ -544,6 +609,3 @@ def _refresh_ops(s, e, grain, ba, sba, ch, site, loc):
         summary, columns,
         f"{kpi_req:.1f}", f"{kpi_sup:.1f}", f"{kpi_gap:.1f}"
     )
-
-
-
