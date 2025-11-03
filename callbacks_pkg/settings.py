@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 import dash
 from dash import html, dcc, dash_table, Output, Input, State, callback
 try:
@@ -504,16 +504,43 @@ def up_bo_forecast(contents, filename):
     L = {c.lower(): c for c in df.columns}
     date_c = L.get("date")
     vol_c  = L.get("forecast volume") or L.get("volume") or L.get("items")
-    sut_c  = L.get("forecast sut") or L.get("sut") or L.get("durationseconds")
+    sut_c  = L.get("forecast sut") or L.get("sut") or L.get("sut_sec") or L.get("avg_sut") or L.get("durationseconds")
 
     if not (date_c and vol_c and sut_c):
         return [], [], "Need Date, Volume/Items and SUT/DurationSeconds"
 
+    # Robust SUT parsing: accept HH:MM, minutes, or seconds
+    def _smart_to_seconds(x):
+        s = str(x).strip().lower()
+        if not s:
+            return None
+        if ":" in s:
+            try:
+                a, b = s.split(":", 1)
+                a = float(a); b = float(b)
+                # treat as MM:SS or HH:MM depending on magnitude; b<60 => minutes:seconds
+                return a*60.0 + b if b < 60 else (a*60.0 + b) * 60.0
+            except Exception:
+                return None
+        if s.endswith("m") or "min" in s:
+            try:
+                return float(s.rstrip("m").replace("min","")) * 60.0
+            except Exception:
+                return None
+        try:
+            v = float(s)
+            # Heuristic: small numbers are minutes, big numbers are already seconds
+            return v*60.0 if v <= 20 else v
+        except Exception:
+            return None
+
     dff = pd.DataFrame({
         "date": pd.to_datetime(df[date_c], errors="coerce").dt.date.astype(str),
         "items": pd.to_numeric(df[vol_c], errors="coerce").fillna(0.0),
-        "sut_sec": pd.to_numeric(df[sut_c], errors="coerce").fillna(0.0),
+        "sut_sec": df[sut_c].apply(_smart_to_seconds),
     })
+    # Default SUT to 600s where missing/unparsed
+    dff["sut_sec"] = dff["sut_sec"].fillna(600.0)
 
     for extra in ["Business Area","Sub Business Area","Channel"]:
         if extra in df.columns:
@@ -533,16 +560,40 @@ def up_bo_actual(contents, filename):
     L = {c.lower(): c for c in df.columns}
     date_c = L.get("date")
     vol_c  = L.get("actual volume") or L.get("volume") or L.get("items")
-    sut_c  = L.get("actual sut") or L.get("sut") or L.get("durationseconds")
+    sut_c  = L.get("actual sut") or L.get("sut") or L.get("sut_sec") or L.get("avg_sut") or L.get("durationseconds")
 
     if not (date_c and vol_c and sut_c):
         return [], [], "Need Date, Volume/Items and SUT/DurationSeconds"
 
+    # Robust SUT parsing (see forecast)
+    def _smart_to_seconds(x):
+        s = str(x).strip().lower()
+        if not s:
+            return None
+        if ":" in s:
+            try:
+                a, b = s.split(":", 1)
+                a = float(a); b = float(b)
+                return a*60.0 + b if b < 60 else (a*60.0 + b) * 60.0
+            except Exception:
+                return None
+        if s.endswith("m") or "min" in s:
+            try:
+                return float(s.rstrip("m").replace("min","")) * 60.0
+            except Exception:
+                return None
+        try:
+            v = float(s)
+            return v*60.0 if v <= 20 else v
+        except Exception:
+            return None
+
     dff = pd.DataFrame({
         "date": pd.to_datetime(df[date_c], errors="coerce").dt.date.astype(str),
         "items": pd.to_numeric(df[vol_c], errors="coerce").fillna(0.0),
-        "sut_sec": pd.to_numeric(df[sut_c], errors="coerce").fillna(0.0),
+        "sut_sec": df[sut_c].apply(_smart_to_seconds),
     })
+    dff["sut_sec"] = dff["sut_sec"].fillna(600.0)
 
     for extra in ["Business Area","Sub Business Area","Channel"]:
         if extra in df.columns:
