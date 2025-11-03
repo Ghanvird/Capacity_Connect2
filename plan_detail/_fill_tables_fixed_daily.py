@@ -422,6 +422,8 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
             ch = (channel or '').strip().lower()
             if ch.startswith('voice'):
                 base = settings.get('occupancy_cap_voice', settings.get('occupancy', 0.85))
+            elif ch.startswith('back'):
+                base = settings.get('util_bo', settings.get('occupancy', 0.85))
             elif ch.startswith('chat'):
                 base = settings.get('util_chat', settings.get('util_bo', 0.85))
             else:
@@ -595,7 +597,55 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
             pass
 
     # Build shrinkage lower table records
-    shr_records = (pd.DataFrame(shrink_rows).to_dict("records") if shrink_rows else [])
+    if shrink_rows:
+        shr_df = pd.DataFrame(shrink_rows)
+        # Ensure all day columns exist
+        for c in day_ids:
+            if c not in shr_df.columns:
+                shr_df[c] = 0.0
+        # Planned and variance rows (percent)
+        try:
+            planned_pct_val = _settings.get("bo_shrinkage_pct", _settings.get("shrinkage_pct", 0.0))
+            planned_pct_val = float(planned_pct_val or 0.0)
+            if planned_pct_val <= 1.0:
+                planned_pct_val *= 100.0
+        except Exception:
+            planned_pct_val = 0.0
+        # Find Overall Shrinkage % row to compute variance
+        ov_mask = shr_df["metric"].astype(str).str.strip().eq("Overall Shrinkage %")
+        var_row = {"metric": "Variance vs Planned"}
+        plan_row = {"metric": "Planned Shrinkage %"}
+        for d in day_ids:
+            plan_row[d] = planned_pct_val
+            try:
+                ov_val = float(pd.to_numeric(shr_df.loc[ov_mask, d], errors="coerce").fillna(0.0).iloc[0]) if ov_mask.any() else 0.0
+            except Exception:
+                ov_val = 0.0
+            var_row[d] = ov_val - planned_pct_val
+        # Round and format
+        hours_labels = {"OOO Shrink Hours (#)", "In-Office Shrink Hours (#)", "Base Hours (#)", "TTW Hours (#)"}
+        pct_labels   = {"OOO Shrinkage %", "In-Office Shrinkage %", "Overall Shrinkage %", "Planned Shrinkage %", "Variance vs Planned"}
+        # Append planned and variance rows
+        shr_df = pd.concat([shr_df, pd.DataFrame([plan_row, var_row])], ignore_index=True)
+        # Round hours to 1 decimal
+        for lab in hours_labels:
+            m = shr_df["metric"].astype(str).str.strip().eq(lab)
+            if m.any():
+                for d in day_ids:
+                    shr_df.loc[m, d] = pd.to_numeric(shr_df.loc[m, d], errors="coerce").fillna(0.0).round(1)
+        # Round pct to 1 decimal and add % suffix
+        for lab in pct_labels:
+            m = shr_df["metric"].astype(str).str.strip().eq(lab)
+            if m.any():
+                for d in day_ids:
+                    try:
+                        v = float(pd.to_numeric(shr_df.loc[m, d], errors="coerce").fillna(0.0).iloc[0])
+                    except Exception:
+                        v = 0.0
+                    shr_df.loc[m, d] = f"{v:.1f}%"
+        shr_records = shr_df.to_dict("records")
+    else:
+        shr_records = []
 
     # -------- Return 13-item tuple --------
     empty = []
