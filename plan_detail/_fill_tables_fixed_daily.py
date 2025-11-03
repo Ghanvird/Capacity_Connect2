@@ -122,6 +122,9 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
         for c in fw_cols if str(c.get("id")) != "metric"
     ]
 
+    # Reference date used in several branches
+    today = pd.Timestamp('today').date()
+
     # -------- helpers --------
     def _daily_sum(df: pd.DataFrame, val_col: str) -> dict:
         if df is None or df.empty or "date" not in df.columns or val_col not in df.columns:
@@ -264,6 +267,16 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
             m_supply[d] = float(sup_w.get(w, 0.0))
     except Exception:
         pass
+
+    # Prepare daily AHT/SUT maps used for BO calcs (computed here to avoid unbound refs)
+    try:
+        ahtF = _daily_weighted_aht(dfF, weight_col_upload)
+    except Exception:
+        ahtF = {}
+    try:
+        ahtA = _daily_weighted_aht(dfA, weight_col_upload)
+    except Exception:
+        ahtA = {}
 
     # For Back Office (daily/TAT), derive PHC and a proxy Service Level from supply and SUT
     if is_bo:
