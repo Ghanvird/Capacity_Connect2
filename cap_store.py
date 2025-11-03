@@ -1197,6 +1197,3 @@ def save_timeseries(kind: str, scope_key: str, df: pd.DataFrame):
         pass
 
     save_df(name, out)
-
-# Bind public name to merged implementation (overrides earlier stub)
-save_timeseries = _save_timeseries_impl
