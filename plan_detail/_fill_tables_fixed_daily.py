@@ -91,6 +91,13 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
         dfT = _assemble_chat(sk, "tactical")
         weight_col_upload = "items"
         aht_label = "AHT/SUT"
+    elif ch.startswith("back office") or ch in ("bo","backoffice"):
+        # Back Office uses daily items + SUT (no interval calc needed)
+        dfF = _assemble_bo(sk, "forecast")
+        dfA = _assemble_bo(sk, "actual")
+        dfT = _assemble_bo(sk, "tactical")
+        weight_col_upload = "items"
+        aht_label = "SUT"
     else:  # outbound
         dfF = _assemble_ob(sk, "forecast")
         dfA = _assemble_ob(sk, "actual")
@@ -157,6 +164,9 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
             return _voice_interval_calc(df, _settings, ivl_min)
         elif channel.startswith("chat"):
             return _chat_interval_calc(df, _settings, ivl_min)
+        elif channel.startswith("back office") or channel in ("bo","backoffice"):
+            # BO daily calcs handled separately (TAT/Erlang on daily totals)
+            return pd.DataFrame()
         else:
             x = df.copy()
             if "items" not in x.columns:
