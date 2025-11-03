@@ -238,7 +238,7 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
         if isinstance(src_calc, pd.DataFrame) and not src_calc.empty else {}
     )
 
-    # Projected Supply HC — derive from weekly upper and distribute by workdays
+    # Projected Supply HC — derive from weekly upper and repeat per day (no division)
     m_supply = {d: 0.0 for d in day_ids}
     try:
         weeks = _week_span(plan.get("start_week"), plan.get("end_week"))
@@ -256,11 +256,10 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
                             sup_w[str(pd.to_datetime(w).date())] = float(pd.to_numeric(row[w], errors='coerce').fillna(0.0).iloc[0])
                         except Exception:
                             sup_w[str(pd.to_datetime(w).date())] = 0.0
-        # Distribute per day in the week
-        workdays = int(float(_settings.get("workdays_per_week", 7) or 7))
+        # Fill each day with the weekly headcount value (aligns with weekly/monthly semantics)
         for d in day_ids:
             w = str(_monday(d))
-            m_supply[d] = float(sup_w.get(w, 0.0)) / max(1, workdays)
+            m_supply[d] = float(sup_w.get(w, 0.0))
     except Exception:
         pass
 
@@ -349,6 +348,15 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
         return out
 
     upper_df = _round1(upper_df[["metric"] + day_ids])
+    # Display headcount as whole numbers
+    try:
+        msk_hc = upper_df["metric"].astype(str).str.strip().eq("Projected Supply HC")
+        if msk_hc.any():
+            for c in day_ids:
+                if c in upper_df.columns:
+                    upper_df.loc[msk_hc, c] = pd.to_numeric(upper_df.loc[msk_hc, c], errors="coerce").fillna(0.0).round(0).astype(int)
+    except Exception:
+        pass
     # Add % sign to percentage metrics (1 decimal)
     try:
         msk = upper_df["metric"].astype(str).str.strip().eq("Projected Service Level")
