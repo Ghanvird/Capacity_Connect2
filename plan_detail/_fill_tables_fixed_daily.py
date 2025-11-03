@@ -7,6 +7,8 @@ from dash import dash_table
 
 from plan_store import get_plan
 from cap_store import resolve_settings
+from cap_db import load_df
+from common import summarize_shrinkage_bo
 from ._grain_cols import day_cols_for_weeks
 from ._common import _week_span, _canon_scope, _monday, get_plan_meta, _load_ts_with_fallback, _assemble_voice, _assemble_chat, _assemble_ob, _assemble_bo
 from ._calc import _voice_interval_calc, _chat_interval_calc, _ob_interval_calc, _daily_from_intervals, _bo_daily_calc, _fill_tables_fixed
@@ -273,12 +275,21 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
         except Exception:
             productive_sec = 8.0 * 3600.0 * 0.7
 
-        # pick daily SUT from forecast, else actual, else settings default
+        # pick daily SUT: Actual for past/today; Forecast for future; else settings default
         def _sut_for_day(d):
             try:
-                v = ahtF.get(d, None)
-                if v is None or pd.isna(v) or float(v) <= 0:
+                dd = pd.to_datetime(d).date()
+            except Exception:
+                dd = None
+            try:
+                if dd is not None and dd <= today:
                     v = ahtA.get(d, None)
+                    if v is None or pd.isna(v) or float(v) <= 0:
+                        v = ahtF.get(d, None)
+                else:
+                    v = ahtF.get(d, None)
+                    if v is None or pd.isna(v) or float(v) <= 0:
+                        v = ahtA.get(d, None)
                 if v is None or pd.isna(v) or float(v) <= 0:
                     v = float(_settings.get("target_sut", _settings.get("budgeted_sut", 600)) or 600.0)
                 return float(v)
@@ -293,9 +304,13 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
             m_phc[d] = float((sup_fte * productive_sec) / sut)
 
         # Proxy Service Level as Supply/Required (capped to 100%)
-        # Required FTE from forecast first, else actual
+        # Required FTE: Actual for past/today; Forecast for future
         for d in day_ids:
-            req = float(m_fte_f.get(d, m_fte_a.get(d, 0.0)) or 0.0)
+            try:
+                dd = pd.to_datetime(d).date()
+            except Exception:
+                dd = None
+            req = float(((m_fte_a.get(d) if (dd is not None and dd <= today) else m_fte_f.get(d)) or m_fte_a.get(d) or 0.0))
             sup = float(m_supply.get(d, 0.0) or 0.0)
             if req <= 0:
                 m_sl[d] = 100.0 if sup > 0 else 0.0
@@ -386,10 +401,9 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
     ahtA = _daily_weighted_aht(dfA, weight_col_upload)
     ahtT = _daily_weighted_aht(dfT, weight_col_upload)   # include tactical AHT
 
-    # Occupancy from per-interval forecast calcs (weighted by staff_seconds)
-    occ_src = ivl_calc_f if (isinstance(ivl_calc_f, pd.DataFrame) and not ivl_calc_f.empty) else ivl_calc_a
-    occF = _daily_weighted_occ(occ_src)
-    # Override future dates with settings occupancy (channel-specific)
+    # Occupancy from per-interval calcs (weighted). Use Actual for past/today, Forecast for future (fallback to settings).
+    occ_f = _daily_weighted_occ(ivl_calc_f)
+    occ_a = _daily_weighted_occ(ivl_calc_a)
     def _occ_setting_frac(settings: dict, channel: str) -> float:
         try:
             ch = (channel or '').strip().lower()
@@ -407,13 +421,20 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
             return 0.85
     occ_setting = _occ_setting_frac(_settings, ch)
     today = pd.Timestamp('today').date()
+    occF = {}
     for d in list(day_ids):
         try:
             dd = pd.to_datetime(d).date()
-            if dd > today:
-                occF[str(d)] = float(occ_setting)
         except Exception:
-            pass
+            dd = None
+        if dd is not None and dd <= today:
+            val = occ_a.get(d, occ_f.get(d, occ_setting))
+        else:
+            val = occ_f.get(d, occ_setting)
+        try:
+            occF[str(d)] = float(pd.to_numeric(val, errors='coerce')) if val is not None else float(occ_setting)
+        except Exception:
+            occF[str(d)] = float(occ_setting)
 
     # Budgeted AHT/SUT per week → per day
     def _ts_week_dict(df: pd.DataFrame, val_candidates: list[str]) -> dict:
@@ -484,17 +505,105 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
     fw_df = pd.DataFrame.from_dict(fw_data, orient="index", columns=day_ids) \
                         .reset_index().rename(columns={"index":"metric"}).fillna(0.0)
     fw_df = _round1(fw_df[["metric"] + day_ids])
-    # Occupancy is a fraction → format as percentage string with 1 decimal and %
+    # Format percentage rows with 1 decimal and a % suffix
     try:
-        msk = fw_df["metric"].astype(str).str.strip().eq("Occupancy")
-        if msk.any():
-            # ensure object dtype before assigning string values
+        # Occupancy
+        msk_occ = fw_df["metric"].astype(str).str.strip().eq("Occupancy")
+        if msk_occ.any():
             for c in day_ids:
                 if c in fw_df.columns:
                     fw_df[c] = fw_df[c].astype(object)
             for c in day_ids:
                 pct = float(occF.get(c, 0.0) * 100.0)
-                fw_df.loc[msk, c] = f"{pct:.1f}%"
+                fw_df.loc[msk_occ, c] = f"{pct:.1f}%"
+        # Shrinkage rows (if we add them below)
+        msk_shr = fw_df["metric"].astype(str).str.strip().isin(["OOO Shrinkage %","In-Office Shrinkage %","Overall Shrinkage %"])
+        if msk_shr.any():
+            for c in day_ids:
+                if c in fw_df.columns:
+                    try:
+                        v = float(pd.to_numeric(fw_df.loc[msk_shr, c], errors="coerce").fillna(0.0).iloc[0])
+                    except Exception:
+                        v = 0.0
+                    fw_df.loc[msk_shr, c] = f"{v:.1f}%"
+    except Exception:
+        pass
+
+    # ---- Back Office Daily Shrinkage (OOO/INO/Overall) ----
+    # If this is a Back Office plan, compute shrinkage % per day from raw (per-agent-per-day) uploads
+    if is_bo:
+        try:
+            raw = load_df("shrinkage_raw_backoffice")
+        except Exception:
+            raw = None
+        try:
+            if isinstance(raw, pd.DataFrame) and not raw.empty:
+                dsum = summarize_shrinkage_bo(raw)
+                # Filter to scope: BA, SBA, Channel=Back Office, optional Site
+                ba  = str(plan.get("vertical") or "").strip().lower()
+                sba = str(plan.get("sub_ba") or "").strip().lower()
+                site= str(plan.get("site") or plan.get("location") or plan.get("country") or "").strip().lower()
+                if "Business Area" in dsum.columns:
+                    dsum = dsum[dsum["Business Area"].astype(str).str.strip().str.lower().eq(ba) | (ba=="")]
+                if "Sub Business Area" in dsum.columns:
+                    dsum = dsum[dsum["Sub Business Area"].astype(str).str.strip().str.lower().eq(sba) | (sba=="")]
+                if "Channel" in dsum.columns:
+                    dsum = dsum[dsum["Channel"].astype(str).str.strip().str.lower().isin(["back office","bo","backoffice"])]
+                if site and ("Site" in dsum.columns):
+                    # lenient match
+                    dsum = dsum[dsum["Site"].astype(str).str.strip().str.lower().eq(site)]
+                # Aggregate per date
+                dsum["date"] = pd.to_datetime(dsum["date"], errors="coerce").dt.date
+                keep = [c for c in ["OOO Hours","In Office Hours","Base Hours","TTW Hours"] if c in dsum.columns]
+                g = dsum.groupby("date", as_index=False)[keep].sum() if keep else pd.DataFrame()
+                ooo_map = {}
+                ino_map = {}
+                ov_map  = {}
+                for _, r in (g.iterrows() if isinstance(g, pd.DataFrame) and not g.empty else []):
+                    try:
+                        d = str(pd.to_datetime(r["date"]).date())
+                    except Exception:
+                        continue
+                    base = float(r.get("Base Hours", 0.0) or 0.0)
+                    ttw  = float(r.get("TTW Hours",  0.0) or 0.0)
+                    ooo  = float(r.get("OOO Hours",  0.0) or 0.0)
+                    ino  = float(r.get("In Office Hours", 0.0) or 0.0)
+                    ooo_pct = (100.0 * ooo / base) if base > 0 else 0.0
+                    ino_pct = (100.0 * ino / ttw)  if ttw  > 0 else 0.0
+                    ooo_map[d] = ooo_pct
+                    ino_map[d] = ino_pct
+                    ov_map[d]  = ooo_pct + ino_pct
+                # Append rows to FW table
+                if ooo_map or ino_map or ov_map:
+                    rows_to_add = []
+                    def make_row(label, m):
+                        return {"metric": label, **{d: float(m.get(d, 0.0)) for d in day_ids}}
+                    if ooo_map:
+                        rows_to_add.append(make_row("OOO Shrinkage %", ooo_map))
+                    if ino_map:
+                        rows_to_add.append(make_row("In-Office Shrinkage %", ino_map))
+                    if ov_map:
+                        rows_to_add.append(make_row("Overall Shrinkage %", ov_map))
+                    if rows_to_add:
+                        fw_df = pd.concat([fw_df, pd.DataFrame(rows_to_add)], ignore_index=True)
+        except Exception:
+            pass
+
+    # Re-apply percent formatting for shrinkage rows appended above
+    try:
+        msk_shr = fw_df["metric"].astype(str).str.strip().isin(["OOO Shrinkage %","In-Office Shrinkage %","Overall Shrinkage %"])
+        if msk_shr.any():
+            # Round numeric values then format with % suffix
+            for c in day_ids:
+                if c in fw_df.columns:
+                    fw_df.loc[msk_shr, c] = pd.to_numeric(fw_df.loc[msk_shr, c], errors="coerce").fillna(0.0).round(1)
+            for c in day_ids:
+                if c in fw_df.columns:
+                    try:
+                        v = float(pd.to_numeric(fw_df.loc[msk_shr, c], errors="coerce").fillna(0.0).iloc[0])
+                    except Exception:
+                        v = 0.0
+                    fw_df.loc[msk_shr, c] = f"{v:.1f}%"
     except Exception:
         pass
 
