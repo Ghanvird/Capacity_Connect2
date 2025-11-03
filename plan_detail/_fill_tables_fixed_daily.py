@@ -79,6 +79,7 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
                       plan.get("channel") or plan.get("lob"),
                       plan.get("site") or plan.get("location") or plan.get("country"))
 
+    is_bo = False
     if ch.startswith("voice"):
         dfF = _assemble_voice(sk, "forecast")
         dfA = _assemble_voice(sk, "actual")
@@ -98,6 +99,7 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
         dfT = _assemble_bo(sk, "tactical")
         weight_col_upload = "items"
         aht_label = "SUT"
+        is_bo = True
     else:  # outbound
         dfF = _assemble_ob(sk, "forecast")
         dfA = _assemble_ob(sk, "actual")
@@ -261,6 +263,45 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
             m_supply[d] = float(sup_w.get(w, 0.0)) / max(1, workdays)
     except Exception:
         pass
+
+    # For Back Office (daily/TAT), derive PHC and a proxy Service Level from supply and SUT
+    if is_bo:
+        try:
+            hrs = float(_settings.get("bo_hours_per_day", _settings.get("hours_per_fte", 8.0)) or 8.0)
+            shrink = float(_settings.get("bo_shrinkage_pct", _settings.get("shrinkage_pct", 0.30)) or 0.30)
+            util = float(_settings.get("util_bo", 0.85) or 0.85)
+            productive_sec = hrs * 3600.0 * max(1e-6, (1.0 - shrink)) * util
+        except Exception:
+            productive_sec = 8.0 * 3600.0 * 0.7
+
+        # pick daily SUT from forecast, else actual, else settings default
+        def _sut_for_day(d):
+            try:
+                v = ahtF.get(d, None)
+                if v is None or pd.isna(v) or float(v) <= 0:
+                    v = ahtA.get(d, None)
+                if v is None or pd.isna(v) or float(v) <= 0:
+                    v = float(_settings.get("target_sut", _settings.get("budgeted_sut", 600)) or 600.0)
+                return float(v)
+            except Exception:
+                return float(_settings.get("target_sut", _settings.get("budgeted_sut", 600)) or 600.0)
+
+        # Recompute PHC (projected handling capacity) from projected supply
+        # PHC = Supply FTE (per-day) * productive seconds per day / SUT_seconds
+        for d in day_ids:
+            sut = max(1e-6, _sut_for_day(d))
+            sup_fte = float(m_supply.get(d, 0.0) or 0.0)
+            m_phc[d] = float((sup_fte * productive_sec) / sut)
+
+        # Proxy Service Level as Supply/Required (capped to 100%)
+        # Required FTE from forecast first, else actual
+        for d in day_ids:
+            req = float(m_fte_f.get(d, m_fte_a.get(d, 0.0)) or 0.0)
+            sup = float(m_supply.get(d, 0.0) or 0.0)
+            if req <= 0:
+                m_sl[d] = 100.0 if sup > 0 else 0.0
+            else:
+                m_sl[d] = float(min(100.0, max(0.0, (sup / req) * 100.0)))
 
     # Compute variance rows (MTP≈Forecast, Tactical, Budgeted)
     # Budgeted FTE via budget AHT applied to Forecast intervals when possible
