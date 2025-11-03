@@ -252,13 +252,22 @@ def _load_bo(scopes: list[str]) -> pd.DataFrame:
         return pd.DataFrame()
     vc = {c.lower(): c for c in vol.columns}
     sc = {c.lower(): c for c in sut.columns}
-    d_v = vc.get("date","date"); d_s = sc.get("date","date")
-    df = pd.merge(vol.rename(columns={vc.get("items","items"):"items"}),
-                  sut.rename(columns={sc.get("sut_sec","sut_sec"):"sut_sec"}),
-                  left_on=[d_v], right_on=[d_s], how="left").rename(columns={d_v:"date"})
+    d_v = vc.get("date", "date"); d_s = sc.get("date", "date")
+    # Robustly map BO volume → 'items' (accept 'items' or 'volume' variants)
+    src_items = vc.get("items") or vc.get("volume") or vc.get("txns") or vc.get("transactions")
+    vol_ren = vol.rename(columns={src_items: "items"}) if src_items else vol.copy()
+    # Robustly map SUT seconds
+    sut_col = sc.get("sut_sec") or sc.get("sut") or sc.get("aht_sec") or sc.get("aht")
+    sut_ren = sut.rename(columns={sut_col: "sut_sec"}) if sut_col else sut.copy()
+    df = pd.merge(vol_ren,
+                  sut_ren,
+                  left_on=[d_v], right_on=[d_s], how="left").rename(columns={d_v: "date"})
     df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
     if "sut_sec" not in df:
         df["sut_sec"] = 600.0
+    if "items" not in df:
+        # If we couldn't map a volume column, set to 0 rather than erroring downstream
+        df["items"] = 0.0
     # Preserve scope_key if present on either side
     skx = next((c for c in df.columns if c.lower() == "scope_key_x"), None)
     sky = next((c for c in df.columns if c.lower() == "scope_key_y"), None)
@@ -593,7 +602,7 @@ def _refresh_ops(s, e, grain, ba, sba, ch, site, loc):
         bv = v_agg
     if isinstance(bo, pd.DataFrame) and not bo.empty:
         b_day = _agg_by_grain(bo.copy(), "date", grain)
-        b_agg = b_day.groupby("bucket", as_index=False)["items"].sum().rename(columns={"items":"BO Items"})
+        b_agg = b_day.groupby("bucket", as_index=False)["volume"].sum().rename(columns={"items":"BO Items"})
         bv = b_agg if bv.empty else pd.merge(bv, b_agg, on="bucket", how="outer")
     fig_bar = px.bar(title="Workload by Time")
     if not bv.empty:
