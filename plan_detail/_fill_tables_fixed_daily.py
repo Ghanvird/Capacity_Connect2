@@ -518,9 +518,8 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
     fw_df = pd.DataFrame.from_dict(fw_data, orient="index", columns=day_ids) \
                         .reset_index().rename(columns={"index":"metric"}).fillna(0.0)
     fw_df = _round1(fw_df[["metric"] + day_ids])
-    # Format percentage rows with 1 decimal and a % suffix
+    # Format percentage rows with 1 decimal and a % suffix (Occupancy only in FW)
     try:
-        # Occupancy
         msk_occ = fw_df["metric"].astype(str).str.strip().eq("Occupancy")
         if msk_occ.any():
             for c in day_ids:
@@ -529,21 +528,11 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
             for c in day_ids:
                 pct = float(occF.get(c, 0.0) * 100.0)
                 fw_df.loc[msk_occ, c] = f"{pct:.1f}%"
-        # Shrinkage rows (if we add them below)
-        msk_shr = fw_df["metric"].astype(str).str.strip().isin(["OOO Shrinkage %","In-Office Shrinkage %","Overall Shrinkage %"])
-        if msk_shr.any():
-            for c in day_ids:
-                if c in fw_df.columns:
-                    try:
-                        v = float(pd.to_numeric(fw_df.loc[msk_shr, c], errors="coerce").fillna(0.0).iloc[0])
-                    except Exception:
-                        v = 0.0
-                    fw_df.loc[msk_shr, c] = f"{v:.1f}%"
     except Exception:
         pass
 
-    # ---- Back Office Daily Shrinkage (OOO/INO/Overall) ----
-    # If this is a Back Office plan, compute shrinkage % per day from raw (per-agent-per-day) uploads
+    # ---- Back Office Daily Shrinkage (OOO/INO/Overall) for lower grid (not FW) ----
+    shrink_rows = []
     if is_bo:
         try:
             raw = load_df("shrinkage_raw_backoffice")
@@ -586,45 +575,33 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
                     ooo_map[d] = ooo_pct
                     ino_map[d] = ino_pct
                     ov_map[d]  = ooo_pct + ino_pct
-                # Append rows to FW table
-                if ooo_map or ino_map or ov_map:
-                    rows_to_add = []
-                    def make_row(label, m):
-                        return {"metric": label, **{d: float(m.get(d, 0.0)) for d in day_ids}}
-                    if ooo_map:
-                        rows_to_add.append(make_row("OOO Shrinkage %", ooo_map))
-                    if ino_map:
-                        rows_to_add.append(make_row("In-Office Shrinkage %", ino_map))
-                    if ov_map:
-                        rows_to_add.append(make_row("Overall Shrinkage %", ov_map))
-                    if rows_to_add:
-                        fw_df = pd.concat([fw_df, pd.DataFrame(rows_to_add)], ignore_index=True)
+                # Build shrinkage rows for lower grid (hours and %)
+                def row_map(label, m):
+                    return {"metric": label, **{d: float(m.get(d, 0.0)) for d in day_ids}}
+                # Hours
+                hr_ooo = {str(k): float(v) for k, v in zip(g.get("date", []), g.get("OOO Hours", []))} if "OOO Hours" in g.columns else {}
+                hr_ino = {str(k): float(v) for k, v in zip(g.get("date", []), g.get("In Office Hours", []))} if "In Office Hours" in g.columns else {}
+                hr_base= {str(k): float(v) for k, v in zip(g.get("date", []), g.get("Base Hours", []))} if "Base Hours" in g.columns else {}
+                hr_ttw = {str(k): float(v) for k, v in zip(g.get("date", []), g.get("TTW Hours", []))} if "TTW Hours" in g.columns else {}
+                if hr_ooo:  shrink_rows.append(row_map("OOO Shrink Hours (#)", hr_ooo))
+                if hr_ino:  shrink_rows.append(row_map("In-Office Shrink Hours (#)", hr_ino))
+                if hr_base: shrink_rows.append(row_map("Base Hours (#)", hr_base))
+                if hr_ttw:  shrink_rows.append(row_map("TTW Hours (#)", hr_ttw))
+                # Pct (numeric values, UI can format)
+                if ooo_map: shrink_rows.append(row_map("OOO Shrinkage %", ooo_map))
+                if ino_map: shrink_rows.append(row_map("In-Office Shrinkage %", ino_map))
+                if ov_map:  shrink_rows.append(row_map("Overall Shrinkage %", ov_map))
         except Exception:
             pass
 
-    # Re-apply percent formatting for shrinkage rows appended above
-    try:
-        msk_shr = fw_df["metric"].astype(str).str.strip().isin(["OOO Shrinkage %","In-Office Shrinkage %","Overall Shrinkage %"])
-        if msk_shr.any():
-            # Round numeric values then format with % suffix
-            for c in day_ids:
-                if c in fw_df.columns:
-                    fw_df.loc[msk_shr, c] = pd.to_numeric(fw_df.loc[msk_shr, c], errors="coerce").fillna(0.0).round(1)
-            for c in day_ids:
-                if c in fw_df.columns:
-                    try:
-                        v = float(pd.to_numeric(fw_df.loc[msk_shr, c], errors="coerce").fillna(0.0).iloc[0])
-                    except Exception:
-                        v = 0.0
-                    fw_df.loc[msk_shr, c] = f"{v:.1f}%"
-    except Exception:
-        pass
+    # Build shrinkage lower table records
+    shr_records = (pd.DataFrame(shrink_rows).to_dict("records") if shrink_rows else [])
 
     # -------- Return 13-item tuple --------
     empty = []
     return (
         upper_tbl,
         fw_df.to_dict("records"),
-        empty, empty, empty, empty, empty, empty, empty, empty,
+        empty, empty, shr_records, empty, empty, empty, empty, empty,
         empty, empty, empty,
     )
