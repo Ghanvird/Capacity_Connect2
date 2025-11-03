@@ -217,13 +217,21 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
     src_calc = day_calc_f if (isinstance(day_calc_f, pd.DataFrame) and not day_calc_f.empty) else (
         day_calc_a if (isinstance(day_calc_a, pd.DataFrame) and not day_calc_a.empty) else pd.DataFrame()
     )
+    def _safe_float0(x) -> float:
+        try:
+            v = pd.to_numeric(x, errors="coerce")
+            if pd.isna(v):
+                return 0.0
+            return float(v)
+        except Exception:
+            return 0.0
     m_phc   = (
-        {str(pd.to_datetime(r["date"]).date()): float(r.get("phc", 0.0))
+        {str(pd.to_datetime(r["date"]).date()): _safe_float0(r.get("phc"))
          for _, r in src_calc.iterrows()}
         if isinstance(src_calc, pd.DataFrame) and not src_calc.empty else {}
     )
     m_sl    = (
-        {str(pd.to_datetime(r["date"]).date()): float(r.get("service_level", 0.0))
+        {str(pd.to_datetime(r["date"]).date()): _safe_float0(r.get("service_level"))
          for _, r in src_calc.iterrows()}
         if isinstance(src_calc, pd.DataFrame) and not src_calc.empty else {}
     )
