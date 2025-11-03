@@ -98,8 +98,8 @@ def _scopes_from_datasets(ba, sba, ch, site, loc) -> pd.DataFrame:
             rows = cx.execute(
                 """
                 SELECT name FROM datasets
-                 WHERE name LIKE 'voice\_%::%'
-                    OR name LIKE 'bo\_%::%'
+                 WHERE name LIKE 'voice%::%'
+                    OR name LIKE 'bo%::%'
                 """
             ).fetchall()
     except Exception:
@@ -165,8 +165,8 @@ def _dataset_sites_all() -> list[str]:
             rows = cx.execute(
                 """
                 SELECT name FROM datasets
-                 WHERE name LIKE 'voice\_%::%'
-                    OR name LIKE 'bo\_%::%'
+                 WHERE name LIKE 'voice%::%'
+                    OR name LIKE 'bo%::%'
                 """
             ).fetchall()
     except Exception:
@@ -204,7 +204,8 @@ def _load_voice(scopes: list[str]) -> pd.DataFrame:
     if aht.empty:
         aht = load_timeseries_any("voice_tactical_aht", scopes)
     if vol.empty:
-        return make_voice_sample()  # fallback
+        # No data for selected scopes; return empty to avoid dummy numbers
+        return pd.DataFrame()
     # Merge volume + aht on date + interval when present
     vc = {c.lower(): c for c in vol.columns}
     ac = {c.lower(): c for c in aht.columns}
@@ -247,7 +248,8 @@ def _load_bo(scopes: list[str]) -> pd.DataFrame:
     if sut.empty:
         sut = load_timeseries_any("bo_tactical_sut", scopes)
     if vol.empty:
-        return make_backoffice_sample()
+        # No data for selected scopes; return empty to avoid dummy numbers
+        return pd.DataFrame()
     vc = {c.lower(): c for c in vol.columns}
     sc = {c.lower(): c for c in sut.columns}
     d_v = vc.get("date","date"); d_s = sc.get("date","date")
@@ -485,9 +487,13 @@ def _refresh_ops(s, e, grain, ba, sba, ch, site, loc):
         start, end = date.today() - timedelta(days=28), date.today()
 
     map_df = _scope_keys_from_filters(ba, sba, ch, site, loc)
-    if map_df.empty:
-        # Fallback to dataset-derived scopes when HC provides no mapping
-        map_df = _scopes_from_datasets(ba, sba, ch, site, loc)
+    # Prefer dataset-derived scopes when available to avoid duplicating 3-part series
+    ds_map = _scopes_from_datasets(ba, sba, ch, site, loc)
+    if not ds_map.empty:
+        map_df = ds_map
+    elif map_df.empty:
+        # Last resort
+        map_df = ds_map
     scopes = map_df["sk"].unique().tolist()
 
     voice = _load_voice(scopes)
